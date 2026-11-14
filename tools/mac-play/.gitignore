@@ -1,0 +1,7 @@
+*.7z
+engine/
+pool/
+packages/
+maps/
+rapid/
+infolog*.txt

@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# bar-mac: install and play Beyond All Reason on Apple Silicon with the
+# macOS Recoil test builds from tomjn's integration branch (PR #3271).
+#
+# Nothing here is official. Online play on BAR's public servers with an
+# unofficial build risks desyncing other people's games; use skirmish,
+# replays, or private direct-IP games with players who know the risk.
+#
+# Content (game, lobby, maps) is always fetched from BAR's own CDN. This
+# script never bundles or rehosts it.
+
+set -euo pipefail
+
+ENGINE_TAG="${BAR_MAC_ENGINE_TAG:-macos-2026.09.02-test1}"
+ENGINE_VERSION="${BAR_MAC_ENGINE_VERSION:-2026.09.02}"
+ENGINE_REPO="${BAR_MAC_ENGINE_REPO:-tomjn/RecoilEngine}"
+SPRING_HOME="${BAR_MAC_HOME:-$HOME/.spring}"
+GAME_TAG="byar:test"
+LOBBY_TAG="byar-chobby:test"
+DEFAULT_MAP="Red Comet Remake 1.8"
+DEFAULT_PORT=8452
+
+ENGINE_DIR="$SPRING_HOME/engine/macos_arm64/$ENGINE_VERSION"
+
+export PRD_HTTP_SEARCH_URL="https://files-cdn.beyondallreason.dev/find"
+export PRD_RAPID_USE_STREAMER="false"
+export PRD_RAPID_REPO_MASTER="https://repos-cdn.beyondallreason.dev/repos.gz"
+
+die() { echo "bar-mac: $*" >&2; exit 1; }
+say() { echo "==> $*"; }
+
+need_engine() {
+	[[ -x "$ENGINE_DIR/spring" ]] || die "engine not installed; run: bar-mac install"
+}
+
+prd() { "$ENGINE_DIR/pr-downloader" --filesystem-writepath "$SPRING_HOME" "$@"; }
+
+# The archive name the engine needs in a start script, e.g.
+# "Beyond All Reason test-12345-abcdef0", read from the rapid index.
+game_name() {
+	local idx
+	idx=$(ls "$SPRING_HOME"/rapid/*/byar/versions.gz 2>/dev/null | head -1)
+	[[ -n "$idx" ]] || die "game not downloaded; run: bar-mac install"
+	gzip -dc "$idx" | awk -F, -v t="$GAME_TAG" '$1==t {print $4; exit}'
+}
+
+set_setting() { # key value: add or replace a line in springsettings.cfg
+	local cfg="$SPRING_HOME/springsettings.cfg" key="$1" val="$2"
+	touch "$cfg"
+	grep -v "^$key *=" "$cfg" > "$cfg.tmp" || true
+	echo "$key = $val" >> "$cfg.tmp"
+	mv "$cfg.tmp" "$cfg"
+}
+
+cmd_install() {
+	[[ "$(uname -s)/$(uname -m)" == "Darwin/arm64" ]] || die "needs an Apple Silicon Mac"
+	command -v 7zz >/dev/null || die "needs 7zz: brew install sevenzip"
+	mkdir -p "$SPRING_HOME"
+
+	if [[ -x "$ENGINE_DIR/spring" ]]; then
+		say "engine $ENGINE_VERSION already installed"
+	else
+		local tmp url
+		tmp=$(mktemp -d)
+		url="https://github.com/$ENGINE_REPO/releases/download/$ENGINE_TAG/recoil_${ENGINE_VERSION}_arm64-macos.7z"
+		say "downloading engine $ENGINE_TAG"
+		curl -fL --progress-bar -o "$tmp/engine.7z" "$url"
+		mkdir -p "$ENGINE_DIR"
+		7zz x -y "$tmp/engine.7z" -o"$ENGINE_DIR" > /dev/null
+		rm -rf "$tmp"
+		xattr -dr com.apple.quarantine "$ENGINE_DIR" 2>/dev/null || true
+	fi
+
+	say "downloading $GAME_TAG and $LOBBY_TAG from BAR's CDN (first run is large)"
+	prd --download-game "$GAME_TAG"
+	prd --download-game "$LOBBY_TAG"
+	prd --download-map "$DEFAULT_MAP"
+
+	set_setting RapidTagResolutionOrder "repos-cdn.beyondallreason.dev;repos.beyondallreason.dev"
+	cat > "$SPRING_HOME/chobby_config.json" <<-'JSON'
+	{"server": {"address": "server4.beyondallreason.info", "port": 8200, "protocol": "spring", "serverName": "BAR"}, "game": "byar"}
+	JSON
+	say "installed: $(game_name) on engine $ENGINE_VERSION"
+}
+
+cmd_update() { # refresh game and lobby to the current test versions
+	need_engine
+	prd --download-game "$GAME_TAG"
+	prd --download-game "$LOBBY_TAG"
+	say "game is now $(game_name)"
+}
+
+cmd_play() { # the normal BAR lobby, for skirmish and replays
+	need_engine
+	exec "$ENGINE_DIR/spring" --write-dir "$SPRING_HOME" --menu "rapid://$LOBBY_TAG"
+}
+
+cmd_map() {
+	need_engine
+	[[ $# -ge 1 ]] || die "usage: bar-mac map \"Map Name 1.0\""
+	prd --download-map "$1"
+}
+
+# Start script for a direct-IP game. Players are named p1..pN on teams
+# 0..N-1, each its own ally team; every slot shares one password.
+write_host_script() { # file map port players password [ai]
+	local f="$1" map="$2" port="$3" n="$4" pw="$5" ai="${6:-}" game teams i
+	game=$(game_name)
+	teams=$n
+	[[ -n "$ai" ]] && teams=$((n + 1))
+	{
+		echo "[GAME]"
+		echo "{"
+		echo "	MapName=$map;"
+		echo "	GameType=$game;"
+		echo "	HostIP=;"
+		echo "	HostPort=$port;"
+		echo "	IsHost=1;"
+		echo "	NumPlayers=$n;"
+		echo "	NumTeams=$teams;"
+		echo "	NumAllyTeams=$teams;"
+		echo "	StartPosType=1;"
+		for ((i = 0; i < n; i++)); do
+			echo "	[PLAYER$i] { Name=p$((i + 1)); Password=$pw; Spectator=0; Team=$i; }"
+			echo "	[TEAM$i] { TeamLeader=$i; AllyTeam=$i; }"
+			echo "	[ALLYTEAM$i] { NumAllies=0; }"
+		done
+		if [[ -n "$ai" ]]; then
+			echo "	[AI0] { Name=bot; ShortName=$ai; Team=$n; Host=0; }"
+			echo "	[TEAM$n] { TeamLeader=0; AllyTeam=$n; }"
+			echo "	[ALLYTEAM$n] { NumAllies=0; }"
+		fi
+		echo "	[MODOPTIONS] { }"
+		echo "}"
+	} > "$f"
+}
+
+write_join_script() { # file host port name password
+	cat > "$1" <<-EOF
+	[GAME]
+	{
+		HostIP=$2;
+		HostPort=$3;
+		IsHost=0;
+		MyPlayerName=$4;
+		MyPasswd=$5;
+	}
+	EOF
+}
+
+parse_opts() { # sets MAP PORT PLAYERS PASSWORD NAME AI
+	MAP="$DEFAULT_MAP"; PORT=$DEFAULT_PORT; PLAYERS=2; PASSWORD=""; NAME=""; AI=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--map) MAP="$2"; shift 2 ;;
+			--port) PORT="$2"; shift 2 ;;
+			--players) PLAYERS="$2"; shift 2 ;;
+			--password) PASSWORD="$2"; shift 2 ;;
+			--name) NAME="$2"; shift 2 ;;
+			--ai) AI="$2"; shift 2 ;;
+			*) ARGS+=("$1"); shift ;;
+		esac
+	done
+}
+
+cmd_host() { # dedicated server only; players connect with `bar-mac join`
+	need_engine
+	ARGS=(); parse_opts "$@"
+	[[ -n "$PASSWORD" ]] || PASSWORD=$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 8)
+	local dir="$SPRING_HOME/direct"; mkdir -p "$dir"
+	write_host_script "$dir/host.txt" "$MAP" "$PORT" "$PLAYERS" "$PASSWORD" "$AI"
+	say "hosting $(game_name) on $MAP, UDP port $PORT, $PLAYERS players"
+	say "players join with: bar-mac join <this machine's IP> --name pN --password $PASSWORD"
+	say "Windows or Linux players: same engine $ENGINE_VERSION (BAR launcher 'Engine Test') and the same game version"
+	cd "$dir"
+	SPRING_WRITEDIR="$dir/host-home" SPRING_DATADIR="$SPRING_HOME" \
+		exec "$ENGINE_DIR/spring-dedicated" "$dir/host.txt"
+}
+
+cmd_join() {
+	need_engine
+	ARGS=(); parse_opts "$@"
+	[[ ${#ARGS[@]} -ge 1 ]] || die "usage: bar-mac join HOST_IP --name pN --password PW [--port $DEFAULT_PORT]"
+	[[ -n "$NAME" && -n "$PASSWORD" ]] || die "join needs --name and --password from the host"
+	local dir="$SPRING_HOME/direct"; mkdir -p "$dir"
+	write_join_script "$dir/join.txt" "${ARGS[0]}" "$PORT" "$NAME" "$PASSWORD"
+	exec "$ENGINE_DIR/spring" --write-dir "$SPRING_HOME" "$dir/join.txt"
+}
+
+# Local network self-test: a dedicated host and two headless players on
+# 127.0.0.1. Proves host, connect and game start without another machine.
+cmd_selftest() {
+	need_engine
+	ARGS=(); parse_opts "$@"
+	local secs="${ARGS[0]:-60}" dir pw=selftest port=$((DEFAULT_PORT + 100)) rc=0
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/bar-mac-selftest.XXXX")
+	write_host_script "$dir/host.txt" "$MAP" "$port" 2 "$pw" "${AI:-}"
+	write_join_script "$dir/p1.txt" 127.0.0.1 "$port" p1 "$pw"
+	write_join_script "$dir/p2.txt" 127.0.0.1 "$port" p2 "$pw"
+	mkdir -p "$dir/host" "$dir/p1" "$dir/p2"
+	local who
+	for who in host p1 p2; do # flush every line, so a killed run still has its log
+		echo "LogFlushLevel = 0" > "$dir/$who/springsettings.cfg"
+	done
+
+	say "selftest in $dir for ${secs}s"
+	(cd "$dir/host" && SPRING_WRITEDIR="$dir/host" SPRING_DATADIR="$SPRING_HOME" \
+		exec "$ENGINE_DIR/spring-dedicated" "$dir/host.txt" > "$dir/host/stdout.log" 2>&1) &
+	local hpid=$!
+	sleep 3
+	(cd "$dir/p1" && SPRING_WRITEDIR="$dir/p1" SPRING_DATADIR="$SPRING_HOME" \
+		exec "$ENGINE_DIR/spring-headless" "$dir/p1.txt" > "$dir/p1/stdout.log" 2>&1) &
+	local p1=$!
+	(cd "$dir/p2" && SPRING_WRITEDIR="$dir/p2" SPRING_DATADIR="$SPRING_HOME" \
+		exec "$ENGINE_DIR/spring-headless" "$dir/p2.txt" > "$dir/p2/stdout.log" 2>&1) &
+	local p2=$!
+
+	sleep "$secs"
+	kill "$p1" "$p2" "$hpid" 2>/dev/null || true
+	wait 2>/dev/null || true
+
+	local joined frame
+	joined=$(grep -c "Connection established" "$dir/host/infolog.txt" 2>/dev/null || true)
+	say "host accepted $joined of 2 players"
+	[[ "$joined" -ge 2 ]] || rc=1
+	for who in p1 p2; do
+		frame=$(grep -oE "\[f=[0-9]+\]" "$dir/$who/infolog.txt" 2>/dev/null | tail -1 | tr -dc 0-9)
+		say "$who last simulated frame: ${frame:-none (game never started)}"
+		[[ -n "$frame" ]] || rc=1
+	done
+	if grep -qiE "sync ?error|desync" "$dir"/*/infolog.txt 2>/dev/null; then
+		say "sync errors logged:"; grep -iE "sync ?error|desync" "$dir"/*/infolog.txt | head -5; rc=1
+	fi
+	[[ $rc -eq 0 ]] && say "PASS" || say "FAIL"
+	say "logs kept in $dir"
+	return $rc
+}
+
+usage() {
+	cat <<-EOF
+	bar-mac: Beyond All Reason on Apple Silicon (unofficial, test engine $ENGINE_VERSION)
+
+	  bar-mac install            engine + BAR test game + lobby + one map
+	  bar-mac update             refresh game and lobby
+	  bar-mac play               open the BAR lobby (skirmish, replays)
+	  bar-mac map "Name 1.0"     download a map from BAR's CDN
+	  bar-mac host [--map M] [--players N] [--password P] [--port $DEFAULT_PORT] [--ai BARb]
+	  bar-mac join HOST_IP --name pN --password P [--port $DEFAULT_PORT]
+	  bar-mac selftest [SECONDS]  local host + two headless players
+
+	Data lives in \$BAR_MAC_HOME (default ~/.spring).
+	EOF
+}
+
+case "${1:-}" in
+	install|update|play|map|host|join|selftest) c="$1"; shift; "cmd_$c" "$@" ;;
+	*) usage ;;
+esac
