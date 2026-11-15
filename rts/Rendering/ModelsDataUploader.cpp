@@ -1,5 +1,6 @@
 #include "ModelsDataUploader.h"
 
+#include <cstdlib>
 #include <limits>
 #include <cassert>
 
@@ -32,7 +33,23 @@
 ////////////////////////////////////////////////////////////////////
 
 namespace Impl {
+#ifdef __APPLE__
+	// Zink on KosmicKrisp completes GPU work two or three frames behind the
+	// CPU, so a 3-deep ring makes Map() wait on a fence that has not
+	// signaled yet. More slots keep the waited fence old enough to be done,
+	// for a few MB of extra SSBO. SPRING_MAC_UPLOAD_BUFFERING (3 to 8)
+	// overrides the default of 6.
+	static const uint32_t PERSISTENT_MAPPING_BUFFERING = []() -> uint32_t {
+		if (const char* s = getenv("SPRING_MAC_UPLOAD_BUFFERING")) {
+			const int v = atoi(s);
+			if (v >= 3 && v <= 8)
+				return static_cast<uint32_t>(v);
+		}
+		return 6u;
+	}();
+#else
 	static constexpr uint32_t PERSISTENT_MAPPING_BUFFERING = 3u;
+#endif
 
 	template<
 		typename DataType,
