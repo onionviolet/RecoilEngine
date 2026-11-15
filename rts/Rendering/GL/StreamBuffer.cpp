@@ -117,7 +117,10 @@ void IStreamBufferConcept::WaitBuffer(BufferFence& fence) const
 
 	uint32_t gWaitCount = 0;
 	while (true) {
-		GLenum waitReturn = glClientWaitSync(fence.sync, GL_SYNC_FLUSH_COMMANDS_BIT, 1);
+		// Block up to 250 us per call rather than 1 ns. Each call round-trips the
+		// driver, which is costly on translation stacks such as Zink, and an
+		// unsignaled fence used to cost thousands of calls a frame here.
+		GLenum waitReturn = glClientWaitSync(fence.sync, GL_SYNC_FLUSH_COMMANDS_BIT, 250000);
 		if (waitReturn == GL_ALREADY_SIGNALED || waitReturn == GL_CONDITION_SATISFIED)
 			break;
 
