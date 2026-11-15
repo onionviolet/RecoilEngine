@@ -28,10 +28,20 @@ The test engine reports 2026.09.02, BAR's "Engine Test" version. It cannot join 
 
 These never touch BAR's servers. Everyone needs engine 2026.09.02 and the same `byar:test` game version. Windows and Linux players get that engine from the official launcher's "Engine Test" setup.
 
+Before every session:
+
 ```sh
-bar-mac host --players 2 --map "Red Comet Remake 1.8"     # prints a password
-bar-mac join HOST_IP --name p2 --password PASSWORD
+bar-mac check      # exits 1 if this Mac no longer matches what Windows players get
+bar-mac update     # if check says the test game moved on; everyone updates their launcher too
 ```
+
+Then host:
+
+```sh
+bar-mac host --players 3 --address PUBLIC_ADDRESS     # prints a password
+```
+
+`host` also writes `~/.spring/direct/players/`: one `join-pN.txt` per player and a `HOW-TO-JOIN.txt`, all with Windows line endings. Send each player their file and the how-to. A Windows player saves the file in the BAR launcher's `data` folder and runs `engine\recoil_2026.09.02\spring.exe --write-dir "%CD%" join-pN.txt` from there. Mac players run `bar-mac join ADDRESS --name pN --password PASSWORD`. `--no-start` writes the files without starting the server.
 
 The host listens on UDP 8452 (`--port` to change). Players outside the host's network need a reachable address: a VPN such as Tailscale or ZeroTier, a forwarded port, or a host running on a rented server. Many campus and office networks block devices from reaching each other.
 

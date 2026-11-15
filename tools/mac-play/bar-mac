@@ -44,6 +44,8 @@ game_name() {
 	gzip -dc "$idx" | awk -F, -v t="$GAME_TAG" '$1==t {print $4; exit}'
 }
 
+installed_tag() { cat "$ENGINE_DIR/.bar-mac-tag" 2>/dev/null || echo "unknown"; }
+
 set_setting() { # key value: add or replace a line in springsettings.cfg
 	local cfg="$SPRING_HOME/springsettings.cfg" key="$1" val="$2"
 	touch "$cfg"
@@ -57,18 +59,21 @@ cmd_install() {
 	command -v 7zz >/dev/null || die "needs 7zz: brew install sevenzip"
 	mkdir -p "$SPRING_HOME"
 
-	if [[ -x "$ENGINE_DIR/spring" ]]; then
-		say "engine $ENGINE_VERSION already installed"
+	# A test build is identified by its release tag, not its version: tomjn
+	# ships several test builds of one engine version.
+	if [[ -x "$ENGINE_DIR/spring" && "$(installed_tag)" == "$ENGINE_TAG" ]]; then
+		say "engine $ENGINE_TAG already installed"
 	else
 		local tmp url
 		tmp=$(mktemp -d)
 		url="https://github.com/$ENGINE_REPO/releases/download/$ENGINE_TAG/recoil_${ENGINE_VERSION}_arm64-macos.7z"
-		say "downloading engine $ENGINE_TAG"
+		say "downloading engine $ENGINE_TAG (installed: $(installed_tag))"
 		curl -fL --progress-bar -o "$tmp/engine.7z" "$url"
 		mkdir -p "$ENGINE_DIR"
 		7zz x -y "$tmp/engine.7z" -o"$ENGINE_DIR" > /dev/null
 		rm -rf "$tmp"
 		xattr -dr com.apple.quarantine "$ENGINE_DIR" 2>/dev/null || true
+		echo "$ENGINE_TAG" > "$ENGINE_DIR/.bar-mac-tag"
 	fi
 
 	say "downloading $GAME_TAG and $LOBBY_TAG from BAR's CDN (first run is large)"
@@ -148,8 +153,8 @@ write_join_script() { # file host port name password
 	EOF
 }
 
-parse_opts() { # sets MAP PORT PLAYERS PASSWORD NAME AI
-	MAP="$DEFAULT_MAP"; PORT=$DEFAULT_PORT; PLAYERS=2; PASSWORD=""; NAME=""; AI=""
+parse_opts() { # sets MAP PORT PLAYERS PASSWORD NAME AI ADDRESS NOSTART
+	MAP="$DEFAULT_MAP"; PORT=$DEFAULT_PORT; PLAYERS=2; PASSWORD=""; NAME=""; AI=""; ADDRESS=""; NOSTART=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 			--map) MAP="$2"; shift 2 ;;
@@ -158,20 +163,60 @@ parse_opts() { # sets MAP PORT PLAYERS PASSWORD NAME AI
 			--password) PASSWORD="$2"; shift 2 ;;
 			--name) NAME="$2"; shift 2 ;;
 			--ai) AI="$2"; shift 2 ;;
+			--address) ADDRESS="$2"; shift 2 ;;
+			--no-start) NOSTART=1; shift ;;
 			*) ARGS+=("$1"); shift ;;
 		esac
 	done
 }
 
-cmd_host() { # dedicated server only; players connect with `bar-mac join`
+# One join file per player, with Windows line endings so Notepad shows it
+# correctly, plus a short how-to. Hand each player their file.
+write_player_kit() { # dir address port players password
+	local dir="$1" addr="$2" port="$3" n="$4" pw="$5" i f
+	mkdir -p "$dir/players"
+	for ((i = 1; i <= n; i++)); do
+		f="$dir/players/join-p$i.txt"
+		write_join_script "$f" "$addr" "$port" "p$i" "$pw"
+		sed -i '' 's/$/\r/' "$f"
+	done
+	cat > "$dir/players/HOW-TO-JOIN.txt" <<-EOF
+	Beyond All Reason private game: $(game_name), engine $ENGINE_VERSION, map $MAP
+
+	Windows
+	  1. Open the Beyond All Reason launcher, pick "Engine Test" in the
+	     dropdown, and let it finish updating. Close the lobby that opens.
+	  2. Save your file (join-pN.txt) into the launcher's data folder:
+	       <BAR install folder>\\data
+	     The default install folder is usually
+	       %LOCALAPPDATA%\\Programs\\Beyond-All-Reason
+	  3. Open Command Prompt in that data folder and run:
+	       engine\\recoil_${ENGINE_VERSION}\\spring.exe --write-dir "%CD%" join-pN.txt
+	     If Windows Firewall asks, allow spring.exe.
+
+	Mac (bar-mac)
+	  bar-mac join $addr --name pN --password $pw --port $port
+
+	Everyone needs the same game version. If you see a version or checksum
+	error, everyone updates the launcher ("Engine Test") or runs
+	bar-mac update, and the host restarts.
+	EOF
+	sed -i '' 's/$/\r/' "$dir/players/HOW-TO-JOIN.txt"
+}
+
+cmd_host() { # dedicated server only; players connect with `bar-mac join` or a join file
 	need_engine
 	ARGS=(); parse_opts "$@"
 	[[ -n "$PASSWORD" ]] || PASSWORD=$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 8)
+	[[ -n "$ADDRESS" ]] || ADDRESS="HOST_ADDRESS"
 	local dir="$SPRING_HOME/direct"; mkdir -p "$dir"
 	write_host_script "$dir/host.txt" "$MAP" "$PORT" "$PLAYERS" "$PASSWORD" "$AI"
+	write_player_kit "$dir" "$ADDRESS" "$PORT" "$PLAYERS" "$PASSWORD"
 	say "hosting $(game_name) on $MAP, UDP port $PORT, $PLAYERS players"
-	say "players join with: bar-mac join <this machine's IP> --name pN --password $PASSWORD"
-	say "Windows or Linux players: same engine $ENGINE_VERSION (BAR launcher 'Engine Test') and the same game version"
+	say "player files: $dir/players (join-p1.txt .. join-p$PLAYERS.txt, HOW-TO-JOIN.txt)"
+	[[ "$ADDRESS" == HOST_ADDRESS ]] && say "no --address given: players replace HOST_ADDRESS in their file with the address they reach this host at"
+	say "Mac players: bar-mac join $ADDRESS --name pN --password $PASSWORD"
+	[[ $NOSTART -eq 1 ]] && { say "--no-start: files written, server not started"; return 0; }
 	cd "$dir"
 	SPRING_WRITEDIR="$dir/host-home" SPRING_DATADIR="$SPRING_HOME" \
 		exec "$ENGINE_DIR/spring-dedicated" "$dir/host.txt"
@@ -185,6 +230,47 @@ cmd_join() {
 	local dir="$SPRING_HOME/direct"; mkdir -p "$dir"
 	write_join_script "$dir/join.txt" "${ARGS[0]}" "$PORT" "$NAME" "$PASSWORD"
 	exec "$ENGINE_DIR/spring" --write-dir "$SPRING_HOME" "$dir/join.txt"
+}
+
+# Compare what is installed here with what Windows and Linux players get
+# from BAR's launcher today. Exits 1 when a game with them would not match.
+cmd_check() {
+	local rc=0 win_engine remote_game local_game latest_tag
+	win_engine=$(curl -fsL "https://raw.githubusercontent.com/beyond-all-reason/BYAR-Chobby/master/dist_cfg/config.json" |
+		python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(next((s["launch"]["engine"] for s in d["setups"] if s["package"]["display"]=="Engine Test" and s["package"]["platform"]=="win32"),"?"))' 2>/dev/null || echo "?")
+	remote_game=$(curl -fsL "https://repos-cdn.beyondallreason.dev/byar/versions.gz" | gzip -dc 2>/dev/null |
+		awk -F, -v t="$GAME_TAG" '$1==t {print $4; exit}')
+	local_game=$(game_name 2>/dev/null || echo "not installed")
+	latest_tag=$(curl -fsL "https://api.github.com/repos/$ENGINE_REPO/releases?per_page=20" |
+		python3 -c 'import json,sys
+r=[x["tag_name"] for x in json.load(sys.stdin) if x["tag_name"].startswith("macos-")]
+print(r[0] if r else "?")' 2>/dev/null || echo "?")
+
+	echo "engine here:        $ENGINE_VERSION ($(installed_tag))"
+	echo "Windows Engine Test: ${win_engine#recoil_}"
+	echo "newest macOS build: $latest_tag ($ENGINE_REPO)"
+	echo "game here:          $local_game"
+	echo "game on BAR's CDN:  ${remote_game:-?}"
+
+	if [[ "${win_engine#recoil_}" != "$ENGINE_VERSION" ]]; then
+		say "MISMATCH: Windows players now get engine ${win_engine#recoil_}; this Mac runs $ENGINE_VERSION."
+		[[ "$latest_tag" == "macos-${win_engine#recoil_}-"* ]] &&
+			say "fix: BAR_MAC_ENGINE_TAG=$latest_tag BAR_MAC_ENGINE_VERSION=${win_engine#recoil_} bar-mac install" ||
+			say "no macOS build of ${win_engine#recoil_} yet; cross-play waits for one"
+		rc=1
+	fi
+	if [[ -n "$remote_game" && "$remote_game" != "$local_game" ]]; then
+		say "UPDATE: the test game moved on; run bar-mac update (and everyone updates their launcher)"
+		rc=1
+	fi
+	if [[ "$latest_tag" != "$(installed_tag)" && "$latest_tag" == "macos-$ENGINE_VERSION-"* ]]; then
+		say "NEWER BUILD: $latest_tag; run BAR_MAC_ENGINE_TAG=$latest_tag bar-mac install"
+		rc=1
+	fi
+	[[ $rc -eq 0 ]] && say "OK: matches what Windows players get today"
+	return $rc
 }
 
 # Local network self-test: a dedicated host and two headless players on
@@ -244,7 +330,10 @@ usage() {
 	  bar-mac update             refresh game and lobby
 	  bar-mac play               open the BAR lobby (skirmish, replays)
 	  bar-mac map "Name 1.0"     download a map from BAR's CDN
-	  bar-mac host [--map M] [--players N] [--password P] [--port $DEFAULT_PORT] [--ai BARb]
+	  bar-mac check              compare with what Windows players get today
+	  bar-mac host [--map M] [--players N] [--password P] [--port $DEFAULT_PORT]
+	               [--address A] [--ai BARb] [--no-start]
+	                             also writes join files for every player
 	  bar-mac join HOST_IP --name pN --password P [--port $DEFAULT_PORT]
 	  bar-mac selftest [SECONDS]  local host + two headless players
 
@@ -253,6 +342,6 @@ usage() {
 }
 
 case "${1:-}" in
-	install|update|play|map|host|join|selftest) c="$1"; shift; "cmd_$c" "$@" ;;
+	install|update|play|map|check|host|join|selftest) c="$1"; shift; "cmd_$c" "$@" ;;
 	*) usage ;;
 esac
